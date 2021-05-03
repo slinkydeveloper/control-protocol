@@ -23,6 +23,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"knative.dev/pkg/logging"
@@ -153,6 +154,8 @@ func (t *serverTcpConnection) startAcceptPolling(closedServerChannel chan struct
 }
 
 func (t *serverTcpConnection) listenLoop() {
+	var openedConnectionsWg sync.WaitGroup
+	defer openedConnectionsWg.Wait()
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -175,7 +178,11 @@ func (t *serverTcpConnection) listenLoop() {
 				conn = tls.Server(conn, tlsConf)
 			}
 			t.logger.Debugf("Accepting new control connection from %s", conn.RemoteAddr())
-			t.consumeConnection(conn)
+			openedConnectionsWg.Add(1)
+			go func() {
+				t.consumeConnection(conn)
+				openedConnectionsWg.Done()
+			}()
 		}
 	}
 }

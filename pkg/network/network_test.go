@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -259,4 +260,54 @@ func TestManyMessages(t *testing.T) {
 	wg.Wait()
 
 	logging.FromContext(ctx).Infof("Processed: %d", processed.Load())
+}
+
+func TestServerShouldBeAbleToHoldTwoConnectionsAtTheSameTimeAndBroadcast(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	ctx := logging.WithLogger(context.TODO(), logger.Sugar())
+
+	clientCtx, clientCancelFn := context.WithCancel(ctx)
+	serverCtx, serverCancelFn := context.WithCancel(ctx)
+
+	controlServer, err := network.StartInsecureControlServer(serverCtx, network.WithPort(0))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		serverCancelFn()
+		<-controlServer.ClosedCh()
+	})
+
+	client1, err := network.StartControlClient(clientCtx, &net.Dialer{}, fmt.Sprintf("127.0.0.1:%d", controlServer.ListeningPort()))
+	require.NoError(t, err)
+	client2, err := network.StartControlClient(clientCtx, &net.Dialer{}, fmt.Sprintf("127.0.0.1:%d", controlServer.ListeningPort()))
+	require.NoError(t, err)
+	t.Cleanup(clientCancelFn)
+
+	// Let's try sending messages from clients to the server
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	controlServer.MessageHandler(control.MessageHandlerFunc(func(ctx context.Context, message control.ServiceMessage) {
+		assert.Equal(t, uint8(2), message.Headers().OpCode())
+		assert.Equal(t, "Funky!", string(message.Payload()))
+		message.Ack()
+		wg.Done()
+	}))
+	require.Error(t, client1.SendAndWaitForAck(2, test.MockPayload("Funky!")), "abc")
+	require.Error(t, client2.SendAndWaitForAck(2, test.MockPayload("Funky!")), "abc")
+
+	wg.Wait()
+
+	// Let's try sending message from the server to the clients
+	wg = sync.WaitGroup{}
+	client1.MessageHandler(control.MessageHandlerFunc(func(ctx context.Context, message control.ServiceMessage) {
+		message.Ack()
+		wg.Done()
+	}))
+	client2.MessageHandler(control.MessageHandlerFunc(func(ctx context.Context, message control.ServiceMessage) {
+		message.Ack()
+		wg.Done()
+	}))
+
+	require.Error(t, controlServer.SendAndWaitForAck(2, test.MockPayload("Funky!")), "abc")
+
+	wg.Wait()
 }
